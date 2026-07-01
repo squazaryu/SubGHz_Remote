@@ -29,6 +29,7 @@ App(
     requires=[
         "gui",
         "dialogs",
+        "subghz_radio_broker",
     ],
     stack_size=2 * 1024,
     targets=["f7"],
