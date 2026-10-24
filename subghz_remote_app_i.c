@@ -5,6 +5,8 @@
 #include <flipper_format/flipper_format_i.h>
 
 #include "helpers/txrx/subghz_txrx.h"
+#include <signal_file/signal_file.h>
+#include <lib/subghz/blocks/generic.h>
 #ifndef FW_ORIGIN_Official
 #include <lib/subghz/blocks/custom_btn.h>
 #endif
@@ -189,35 +191,8 @@ bool subrem_save_protocol_to_file(FlipperFormat* flipper_format, const char* sub
     furi_assert(sub_file_name);
 
     Storage* storage = furi_record_open(RECORD_STORAGE);
-    Stream* flipper_format_stream = flipper_format_get_raw_stream(flipper_format);
-
-    bool saved = false;
-    uint32_t repeat = 200;
-    FuriString* file_dir = furi_string_alloc();
-
-    path_extract_dirname(sub_file_name, file_dir);
-    do {
-        // removing additional fields
-        flipper_format_delete_key(flipper_format, "Repeat");
-        // flipper_format_delete_key(flipper_format, "Manufacture");
-
-        if(!storage_simply_remove(storage, sub_file_name)) {
-            break;
-        }
-
-        //ToDo check Write
-        stream_seek(flipper_format_stream, 0, StreamOffsetFromStart);
-        stream_save_to_file(flipper_format_stream, storage, sub_file_name, FSOM_CREATE_ALWAYS);
-
-        if(!flipper_format_insert_or_update_uint32(flipper_format, "Repeat", &repeat, 1)) {
-            FURI_LOG_E(TAG, "Unable Repeat");
-            break;
-        }
-
-        saved = true;
-    } while(0);
-
-    furi_string_free(file_dir);
+    bool saved =
+        signal_file_update(storage, flipper_format_get_raw_stream(flipper_format), sub_file_name);
     furi_record_close(RECORD_STORAGE);
     return saved;
 }
@@ -227,8 +202,13 @@ void subrem_save_active_sub(void* context) {
     SubGhzRemoteApp* app = context;
 
     SubRemSubFilePreset* sub_preset = app->map_preset->subs_preset[app->chosen_sub];
-    subrem_save_protocol_to_file(
-        sub_preset->fff_data, furi_string_get_cstr(sub_preset->file_path));
+    if(!subrem_save_protocol_to_file(
+           sub_preset->fff_data, furi_string_get_cstr(sub_preset->file_path))) {
+        app->save_failed = true;
+        notification_message(app->notifications, &sequence_blink_red_100);
+        dialog_message_show_storage_error(
+            app->dialogs, "Signal not saved.\nKeep .tumo-bak\nif present.");
+    }
 }
 
 bool subrem_tx_start_sub(SubGhzRemoteApp* app, SubRemSubFilePreset* sub_preset) {
@@ -236,15 +216,14 @@ bool subrem_tx_start_sub(SubGhzRemoteApp* app, SubRemSubFilePreset* sub_preset) 
     furi_assert(sub_preset);
     bool ret = false;
 
-    subrem_tx_stop_sub(app, true);
-
     if(sub_preset->type == SubGhzProtocolTypeUnknown) {
         ret = false;
     } else {
         FURI_LOG_I(TAG, "Send %s", furi_string_get_cstr(sub_preset->label));
 
-        subghz_txrx_load_decoder_by_name_protocol(
-            app->txrx, furi_string_get_cstr(sub_preset->protocol_name));
+        if(!subghz_txrx_load_decoder_by_name_protocol(
+               app->txrx, furi_string_get_cstr(sub_preset->protocol_name)))
+            return false;
 
         subghz_txrx_set_preset(
             app->txrx,
@@ -255,11 +234,22 @@ bool subrem_tx_start_sub(SubGhzRemoteApp* app, SubRemSubFilePreset* sub_preset) 
 #ifndef FW_ORIGIN_Official
         subghz_custom_btns_reset();
         subghz_txrx_custom_button_reset(app->txrx);
-
-        subghz_txrx_custom_button_set(app->txrx, sub_preset->button);
+        SubGhzProtocolDecoderBase* decoder = subghz_txrx_get_decoder(app->txrx);
+        if(!decoder || subghz_protocol_decoder_base_deserialize(decoder, sub_preset->fff_data) !=
+                           SubGhzProtocolStatusOk)
+            return false;
+        FuriString* description = furi_string_alloc();
+        subghz_protocol_decoder_base_get_string(decoder, description);
+        furi_string_free(description);
+        if(subghz_custom_btn_is_allowed() && subghz_custom_btn_get_original()) {
+            subghz_custom_btn_set(sub_preset->button);
+        }
 #endif
+        subghz_block_generic_global.endless_tx = sub_preset->type != SubGhzProtocolTypeRAW;
         if(subghz_txrx_tx_start(app->txrx, sub_preset->fff_data) == SubGhzTxRxStartTxStateOk) {
             ret = true;
+        } else {
+            subghz_block_generic_global.endless_tx = false;
         }
     }
 
@@ -268,31 +258,21 @@ bool subrem_tx_start_sub(SubGhzRemoteApp* app, SubRemSubFilePreset* sub_preset) 
 
 bool subrem_tx_stop_sub(SubGhzRemoteApp* app, bool forced) {
     furi_assert(app);
-    SubRemSubFilePreset* sub_preset = app->map_preset->subs_preset[app->chosen_sub];
-
-    if(forced || (sub_preset->type != SubGhzProtocolTypeRAW)) {
-#ifndef FW_ORIGIN_Official
-        if(subghz_custom_btn_get() != SUBGHZ_CUSTOM_BTN_OK) {
-            subghz_custom_btn_set(SUBGHZ_CUSTOM_BTN_OK);
-            subghz_txrx_custom_button_reset(app->txrx);
-
-            // Call deserialize yet another time to restore the original button if a custom button was used
-            subghz_transmitter_deserialize(app->txrx->transmitter, sub_preset->fff_data);
-
-            subghz_custom_btns_reset();
-        }
-#endif
-        subghz_txrx_stop(app->txrx);
-#ifndef FW_ORIGIN_Official
-        if(sub_preset->type == SubGhzProtocolTypeDynamic) {
-            subghz_txrx_reset_dynamic_and_custom_btns(app->txrx);
-        }
-        subghz_custom_btns_reset();
-#endif
-        return true;
+    app->tx_held = false;
+    subghz_block_generic_global.endless_tx = false;
+    if(!forced) return !app->tx_running;
+    subghz_txrx_stop(app->txrx);
+    app->tx_running = false;
+    if(app->txrx->restore_failed) {
+        app->txrx->restore_failed = false;
+        app->save_failed = true;
+        dialog_message_show_storage_error(
+            app->dialogs, "Button restore failed.\nSignal unchanged.");
     }
-
-    return false;
+#ifndef FW_ORIGIN_Official
+    subghz_txrx_reset_dynamic_and_custom_btns(app->txrx);
+#endif
+    return true;
 }
 
 SubRemLoadMapState subrem_load_from_file(SubGhzRemoteApp* app) {
