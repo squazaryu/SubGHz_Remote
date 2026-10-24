@@ -11,12 +11,6 @@ void subrem_scene_remote_callback(SubRemCustomEvent event, void* context) {
     view_dispatcher_send_custom_event(app->view_dispatcher, event);
 }
 
-void subrem_scene_remote_raw_callback_end_tx(void* context) {
-    furi_assert(context);
-    SubGhzRemoteApp* app = context;
-    view_dispatcher_send_custom_event(app->view_dispatcher, SubRemCustomEventViewRemoteForcedStop);
-}
-
 static uint8_t subrem_scene_remote_event_to_index(SubRemCustomEvent event_id) {
     uint8_t ret = 0;
 
@@ -52,6 +46,7 @@ bool subrem_scene_remote_on_event(void* context, SceneManagerEvent event) {
     SubGhzRemoteApp* app = context;
     if(event.type == SceneManagerEventTypeCustom) {
         if(event.event == SubRemCustomEventViewRemoteBack) {
+            subrem_tx_stop_sub(app, true);
             if(!scene_manager_previous_scene(app->scene_manager)) {
                 scene_manager_stop(app->scene_manager);
                 view_dispatcher_stop(app->view_dispatcher);
@@ -65,22 +60,22 @@ bool subrem_scene_remote_on_event(void* context, SceneManagerEvent event) {
             event.event == SubRemCustomEventViewRemoteStartOK) {
             // Start sending sub
             subrem_tx_stop_sub(app, true);
+            app->save_failed = false;
 
             uint8_t chosen_sub = subrem_scene_remote_event_to_index(event.event);
             app->chosen_sub = chosen_sub;
+            app->tx_held = true;
 
             subrem_view_remote_set_state(
                 app->subrem_remote_view, SubRemViewRemoteStateLoading, chosen_sub);
 
-            if(subrem_tx_start_sub(app, app->map_preset->subs_preset[chosen_sub])) {
-                if(app->map_preset->subs_preset[chosen_sub]->type == SubGhzProtocolTypeRAW) {
-                    subghz_txrx_set_raw_file_encoder_worker_callback_end(
-                        app->txrx, subrem_scene_remote_raw_callback_end_tx, app);
-                }
+            app->tx_running = subrem_tx_start_sub(app, app->map_preset->subs_preset[chosen_sub]);
+            if(app->tx_running) {
                 subrem_view_remote_set_state(
                     app->subrem_remote_view, SubRemViewRemoteStateSending, chosen_sub);
                 notification_message(app->notifications, &sequence_blink_start_magenta);
             } else {
+                app->tx_held = false;
                 subrem_view_remote_set_state(
                     app->subrem_remote_view, SubRemViewRemoteStateIdle, 0);
                 notification_message(app->notifications, &sequence_blink_red_100);
@@ -101,9 +96,25 @@ bool subrem_scene_remote_on_event(void* context, SceneManagerEvent event) {
             }
             return true;
         }
+    } else if(
+        event.type == SceneManagerEventTypeTick && app->tx_running &&
+        subghz_txrx_tx_is_complete(app->txrx)) {
+        bool restart_raw = app->tx_held && app->map_preset->subs_preset[app->chosen_sub]->type ==
+                                               SubGhzProtocolTypeRAW;
+        subrem_tx_stop_sub(app, true);
+        if(restart_raw) {
+            app->tx_running =
+                subrem_tx_start_sub(app, app->map_preset->subs_preset[app->chosen_sub]);
+            app->tx_held = app->tx_running;
+        }
+        if(!app->tx_running) {
+            subrem_view_remote_set_state(app->subrem_remote_view, SubRemViewRemoteStateIdle, 0);
+            notification_message(app->notifications, &sequence_blink_stop);
+            if(restart_raw || app->save_failed)
+                notification_message(app->notifications, &sequence_blink_red_100);
+        }
+        return true;
     }
-    // } else if(event.type == SceneManagerEventTypeTick) {
-    // }
     return false;
 }
 

@@ -14,6 +14,9 @@ struct SubGhzTxRx {
     SubGhzTransmitter* transmitter;
     SubGhzProtocolDecoderBase* decoder_result;
     FlipperFormat* fff_data;
+    // Borrowed until stop; the app keeps the mapped preset alive throughout TX.
+    FlipperFormat* tx_data;
+    bool restore_failed;
 
     SubGhzRadioPreset* preset;
     SubGhzSetting* setting;

@@ -116,6 +116,10 @@ SubGhzRemoteApp* subghz_remote_app_alloc() {
     subghz_txrx_set_need_save_callback(app->txrx, subrem_save_active_sub, app);
 
     app->map_not_saved = false;
+    app->chosen_sub = 0;
+    app->tx_running = false;
+    app->tx_held = false;
+    app->save_failed = false;
 
     return app;
 }
@@ -123,6 +127,8 @@ SubGhzRemoteApp* subghz_remote_app_alloc() {
 void subghz_remote_app_free(SubGhzRemoteApp* app) {
     furi_assert(app);
 
+    // Save callbacks still need the map, dialogs and notification records.
+    subrem_tx_stop_sub(app, true);
     furi_hal_power_suppress_charge_exit();
 
     // Submenu

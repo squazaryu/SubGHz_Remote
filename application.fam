@@ -39,6 +39,7 @@ App(
     fap_category="Sub-GHz",
     fap_icon_assets="icons",
     fap_icon_assets_symbol="subghz_remote",
-    fap_version="1.8",
+    fap_libs=["signal_file"],
+    fap_version="1.9",
     fap_weburl="https://github.com/DarkFlippers/SubGHz_Remote",
 )
